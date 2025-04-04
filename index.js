@@ -30,12 +30,11 @@ if (!REPRESENTATIVE_SHOP) {
 }
 
 // In-memory snapshot to store fetched variant data by SKU
-// (Used later for update operations)
 let memorySnapshot = {};
 
 /**
  * GET /fetch?sku=SKU123
- * Uses Shopify GraphQL API of the representative shop to fetch variant details by SKU.
+ * Uses Shopify's GraphQL API of the representative shop to fetch variant details by SKU.
  */
 app.get('/fetch', async (req, res) => {
   try {
@@ -54,7 +53,6 @@ app.get('/fetch', async (req, res) => {
               sku
               price
               inventoryQuantity
-              status
               product {
                 title
               }
@@ -90,8 +88,10 @@ app.get('/fetch', async (req, res) => {
     const variant = edges[0].node;
     // Extract numeric variant id from global id (gid://shopify/ProductVariant/1234567890)
     const numericVariantId = variant.id.split('/').pop();
+    
     // Save fetched variant in memory snapshot (keyed by SKU)
     memorySnapshot[sku] = { ...variant, numericVariantId };
+    
     res.json({ message: 'Fetch completed successfully.', data: { ...variant, numericVariantId } });
   } catch (err) {
     console.error("Error in /fetch:", err);
@@ -108,7 +108,7 @@ app.get('/fetch', async (req, res) => {
  *   ],
  *   "selectedShops": ["SI", "HR"]
  * }
- * For each updated row, uses the in-memory snapshot to get the Shopify variant ID and calls the REST API of each selected shop.
+ * For each updated row, it retrieves the variant ID from memory and calls the Shopify REST API on each selected shop.
  */
 app.post('/update', async (req, res) => {
   try {
@@ -133,11 +133,11 @@ app.post('/update', async (req, res) => {
       
       const numericId = fetched.numericVariantId;
       
-      // Update the variant for each selected shop
+      // Update variant for each selected shop
       for (const shopName of selectedShops) {
         const shop = SHOPIFY_SHOPS.find(s => s.name === shopName);
         if (!shop) continue;
-        // Shopify REST API endpoint to update a variant
+        
         const shopUrl = `https://${shop.domain}/admin/api/2023-04/variants/${numericId}.json`;
         const payload = { variant: changes };
         
@@ -159,7 +159,9 @@ app.post('/update', async (req, res) => {
             sku,
             rowNumber,
             shop: shopName,
-            message: `Update failed: ${err.response ? JSON.stringify(err.response.data.errors) : err.message}`
+            message: `Update failed: ${
+              err.response ? JSON.stringify(err.response.data.errors) : err.message
+            }`
           });
         }
       }
