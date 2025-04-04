@@ -7,7 +7,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Parse Shopify shops from .env
+// Parse Shopify shops from .env (should be a JSON array)
 let SHOPIFY_SHOPS = [];
 try {
   SHOPIFY_SHOPS = JSON.parse(process.env.SHOPIFY_SHOPS);
@@ -18,7 +18,7 @@ try {
   process.exit(1);
 }
 
-// Find the representative shop using the identifier from the .env file
+// Find the representative shop (for fetching) using the identifier from the .env file
 const REPRESENTATIVE_SHOP = SHOPIFY_SHOPS.find(
   (shop) => shop.name === process.env.REPRESENTATIVE_SHOP
 );
@@ -29,109 +29,146 @@ if (!REPRESENTATIVE_SHOP) {
   console.log(`Representative shop set to: ${REPRESENTATIVE_SHOP.name}`);
 }
 
-// In-memory snapshot for change detection
+// In-memory snapshot to store fetched variant data by SKU
+// (Used later for update operations)
 let memorySnapshot = {};
 
-// --- /fetch Endpoint ---
+/**
+ * GET /fetch?sku=SKU123
+ * Uses Shopify GraphQL API of the representative shop to fetch variant details by SKU.
+ */
 app.get('/fetch', async (req, res) => {
   try {
-    // Simulate fetching product variant data from Shopify via the representative shop
-    const sampleData = [
+    const sku = req.query.sku;
+    if (!sku) {
+      return res.status(400).json({ error: "Missing 'sku' query parameter." });
+    }
+    
+    const graphqlUrl = `https://${REPRESENTATIVE_SHOP.domain}/admin/api/2023-04/graphql.json`;
+    const query = `
       {
-        sku: 'SKU123',
-        title: 'Sample Product',
-        status: 'active',
-        description: 'A sample product description',
-        images: 'http://example.com/image1.jpg,http://example.com/image2.jpg',
-        price: '29.99',
-        type: 'T-Shirt',
-        vendor: 'VendorName',
-        collections: 'Summer,Sale',
-        tags: 'new,hot',
-      },
-      // ... additional rows can be added here.
-    ];
-
-    // Update memory snapshot with fetched data (using SKU as key)
-    memorySnapshot = {};
-    sampleData.forEach((row) => {
-      memorySnapshot[row.sku] = row;
-    });
-
-    console.log('Fetched sample data and updated memory snapshot.');
-    // (Google Sheets API integration to update your sheet would be added here)
-    res.json({ message: 'Fetch completed successfully.', data: sampleData });
-  } catch (error) {
-    console.error('Error in /fetch:', error);
-    res.status(500).json({ error: 'Fetch failed.' });
+        productVariants(first: 1, query: "sku:${sku}") {
+          edges {
+            node {
+              id
+              sku
+              price
+              inventoryQuantity
+              status
+              product {
+                title
+              }
+              image {
+                src
+              }
+            }
+          }
+        }
+      }
+    `;
+    
+    const response = await axios.post(
+      graphqlUrl,
+      { query },
+      {
+        headers: {
+          "X-Shopify-Access-Token": REPRESENTATIVE_SHOP.token,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+    
+    const data = response.data;
+    if (data.errors) {
+      console.error("GraphQL errors:", data.errors);
+      return res.status(500).json({ error: data.errors });
+    }
+    const edges = data.data.productVariants.edges;
+    if (edges.length === 0) {
+      return res.status(404).json({ error: "SKU not found" });
+    }
+    const variant = edges[0].node;
+    // Extract numeric variant id from global id (gid://shopify/ProductVariant/1234567890)
+    const numericVariantId = variant.id.split('/').pop();
+    // Save fetched variant in memory snapshot (keyed by SKU)
+    memorySnapshot[sku] = { ...variant, numericVariantId };
+    res.json({ message: 'Fetch completed successfully.', data: { ...variant, numericVariantId } });
+  } catch (err) {
+    console.error("Error in /fetch:", err);
+    res.status(500).json({ error: "Fetch failed", details: err.message });
   }
 });
 
-// --- /update Endpoint ---
+/**
+ * POST /update
+ * Expects a JSON body:
+ * {
+ *   "updatedRows": [
+ *     { "sku": "SKU123", "changes": { "price": "25.99", "tags": "discount,clearance" }, "rowNumber": 1 }
+ *   ],
+ *   "selectedShops": ["SI", "HR"]
+ * }
+ * For each updated row, uses the in-memory snapshot to get the Shopify variant ID and calls the REST API of each selected shop.
+ */
 app.post('/update', async (req, res) => {
   try {
-    // Expected payload example:
-    // { updatedRows: [ { sku: 'SKU123', changes: { price: '25.99', tags: 'discount,clearance' }, rowNumber: 2 } ],
-    //   selectedShops: ['SI', 'HR'] }
     const { updatedRows, selectedShops } = req.body;
+    if (!updatedRows || !selectedShops) {
+      return res.status(400).json({ error: "Missing 'updatedRows' or 'selectedShops' in request body." });
+    }
     const updateResults = [];
-
+    
     for (const row of updatedRows) {
       const { sku, changes, rowNumber } = row;
-      const original = memorySnapshot[sku];
-      if (!original) {
+      const fetched = memorySnapshot[sku];
+      if (!fetched) {
         updateResults.push({
           sku,
           rowNumber,
           shops: selectedShops,
-          message: 'SKU not found in snapshot, skipping update.',
+          message: 'SKU not found in snapshot, skipping update.'
         });
         continue;
       }
-
+      
+      const numericId = fetched.numericVariantId;
+      
       // Update the variant for each selected shop
       for (const shopName of selectedShops) {
-        const shop = SHOPIFY_SHOPS.find((s) => s.name === shopName);
+        const shop = SHOPIFY_SHOPS.find(s => s.name === shopName);
         if (!shop) continue;
-
-        // Note: Shopify expects a variant ID, not SKU. This URL is a placeholder.
-        const shopUrl = `https://${shop.domain}/admin/api/2023-04/variants/${sku}.json`;
+        // Shopify REST API endpoint to update a variant
+        const shopUrl = `https://${shop.domain}/admin/api/2023-04/variants/${numericId}.json`;
         const payload = { variant: changes };
-
+        
         try {
           const response = await axios.put(shopUrl, payload, {
             headers: {
               'X-Shopify-Access-Token': shop.token,
-              'Content-Type': 'application/json',
-            },
+              'Content-Type': 'application/json'
+            }
           });
           updateResults.push({
             sku,
             rowNumber,
             shop: shopName,
-            message: 'Update successful',
+            message: 'Update successful'
           });
         } catch (err) {
           updateResults.push({
             sku,
             rowNumber,
             shop: shopName,
-            message: `Update failed: ${
-              err.response
-                ? JSON.stringify(err.response.data.errors)
-                : err.message
-            }`,
+            message: `Update failed: ${err.response ? JSON.stringify(err.response.data.errors) : err.message}`
           });
         }
       }
     }
-
-    console.log('Update process completed.');
-    // (Google Sheets API integration to update your Logs sheet would be added here)
+    
     res.json({ message: 'Update process completed.', results: updateResults });
-  } catch (error) {
-    console.error('Error in /update:', error);
-    res.status(500).json({ error: 'Update failed.' });
+  } catch (err) {
+    console.error("Error in /update:", err);
+    res.status(500).json({ error: "Update failed", details: err.message });
   }
 });
 
