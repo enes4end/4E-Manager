@@ -52,7 +52,6 @@ app.get('/fetch', async (req, res) => {
               id
               sku
               price
-              compareAtPrice
               inventoryQuantity
               product {
                 title
@@ -60,8 +59,6 @@ app.get('/fetch', async (req, res) => {
               image {
                 src
               }
-              vendor
-              tags
             }
           }
         }
